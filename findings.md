@@ -56,6 +56,12 @@ Status legend: 🔵 active · 🟡 stalled · 🔴 blocked · ✅ confirmed find
 - L6: clone + audit `toolhive-core/authn` validator construction (alg allowlist/audience/JWKS) — the one un-read dependency behind the whole auth story.
 - Underexplored NEW families: (i) MCP broker `VMCP` token endpoint (F3 residual); (ii) client-MCP tool registration path; (iii) compaction/event-fold hostile-snapshot; (iv) provider SSE→chunk parsing under a hostile upstream. Keep F2 result incoming.
 
+### Wave 3 — candidates (uncovered families)
+- **F8 learning/persistence (`engine/learning/*`):** reflection→proposal→materializer→skill drafting + admission/activation gates. Stored-injection vector: can prompt-injected/untrusted content produce a DURABLE learned skill/memory that AUTO-ACTIVATES (validated/evaluated activation) and steers future sessions without re-approval? A learned SKILL that later runs = persistence + escalation. Not yet audited.
+- grpcdriver deep (L1) — what a malicious/attacker-reachable driver can do beyond owner-spoof (it's the storage backend; a compromised driver = full state control).
+- cmd/mecatui remote transport / OIDC (ADR 0277/0284) reauth-owner-recovery — partial overlap W2-B.
+- CI supply-chain deeper (mecatequi author-gate.sh — who can trigger the issue→PR bot; combined with F6 goccy bomb on the bot's own checkout).
+
 ---
 
 ## Confirmed / candidate findings
